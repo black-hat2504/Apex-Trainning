@@ -16,6 +16,37 @@ const state = {
   adminTxFilter: "all",
 };
 
+// Animated Themes
+const THEMES = [
+  { id: "cyber", name: "Cyber Midnight", icon: "🌌" },
+  { id: "aurora", name: "Emerald Aurora", icon: "💎" },
+  { id: "neon", name: "Neon Royale", icon: "🔮" },
+  { id: "gold", name: "Imperial Gold", icon: "✨" },
+];
+let currentThemeIdx = 0;
+
+function applyAnimationTheme(themeId) {
+  const theme = THEMES.find((t) => t.id === themeId) || THEMES[0];
+  currentThemeIdx = THEMES.indexOf(theme);
+  if (theme.id === "cyber") {
+    document.documentElement.removeAttribute("data-theme");
+  } else {
+    document.documentElement.setAttribute("data-theme", theme.id);
+  }
+  const label = document.getElementById("current-theme-name");
+  const icon = document.querySelector(".theme-icon");
+  if (label) label.textContent = theme.name;
+  if (icon) icon.textContent = theme.icon;
+  localStorage.setItem("apex_animated_theme", theme.id);
+}
+
+function cycleAnimationTheme() {
+  currentThemeIdx = (currentThemeIdx + 1) % THEMES.length;
+  const nextTheme = THEMES[currentThemeIdx];
+  applyAnimationTheme(nextTheme.id);
+  showToast(`Switched Theme: ${nextTheme.name}`, "info");
+}
+
 // --- INITIALIZATION ---
 document.addEventListener("DOMContentLoaded", async () => {
   await fetchBankInfo();
@@ -26,6 +57,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   state.user = null;
   updateNavUser();
   showView("auth");
+
+  // Load and apply saved animated theme
+  const savedTheme = localStorage.getItem("apex_animated_theme") || "cyber";
+  applyAnimationTheme(savedTheme);
 
   // Attach logout listener
   document.getElementById("logout-btn").addEventListener("click", handleLogout);

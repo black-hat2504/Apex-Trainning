@@ -12,6 +12,8 @@
 </head>
 <body>
   <!-- Background Glow Orbs -->
+  <!-- Animated Ambient Layers -->
+  <div class="cyber-grid-overlay"></div>
   <div class="bg-glow glow-1"></div>
   <div class="bg-glow glow-2"></div>
   <div class="bg-glow glow-3"></div>
@@ -27,11 +29,17 @@
         </div>
         <div class="brand-text">
           <span class="brand-title">Apex Global Trust</span>
-          <span class="brand-tagline" id="nav-branch-name">Financial District Branch</span>
+          <span class="brand-tagline" id="nav-branch-name">BKC Financial Hub Branch, Mumbai</span>
         </div>
       </div>
 
       <div class="nav-right">
+        <!-- Animated Theme Switcher Button -->
+        <div class="theme-selector-pill" id="theme-selector" onclick="cycleAnimationTheme()" title="Click to Switch Animated Theme">
+          <span class="theme-icon">✨</span>
+          <span class="theme-label" id="current-theme-name">Cyber Midnight</span>
+        </div>
+
         <div class="system-status-pill">
           <span class="pulse-dot"></span>
           <span class="status-text">Core Banking Online</span>

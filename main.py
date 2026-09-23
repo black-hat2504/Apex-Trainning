@@ -1,539 +1,180 @@
-import os
-import secrets
+import os, secrets
 from datetime import datetime, timezone
 from typing import Optional
-from fastapi import FastAPI, Depends, HTTPException, status, Request, Response
+from fastapi import FastAPI, Depends, HTTPException, Request, Response
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-
-from database import get_db, init_db, verify_password, hash_password
+from database import get_db, init_db, db_query, db_execute, verify_password, hash_password
 from auth import create_session, delete_session, get_current_user, get_admin_user
 
-app = FastAPI(
-    title="Apex Global Trust Bank Management System",
-    description="Full-featured banking system with Admin & User portals, bank parameters, and transactions.",
-    version="1.0.0"
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Initialize database schema and default records
+app = FastAPI(title="Apex Global Trust Bank Management System")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 init_db()
 
-# Mount static files
 static_dir = os.path.join(os.path.dirname(__file__), "static")
-os.makedirs(static_dir, exist_ok=True)
-os.makedirs(os.path.join(static_dir, "css"), exist_ok=True)
-os.makedirs(os.path.join(static_dir, "js"), exist_ok=True)
-os.makedirs(os.path.join(os.path.dirname(__file__), "templates"), exist_ok=True)
-
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
-# ----------------- Pydantic Models -----------------
+# Models
+class LoginReq(BaseModel): username: str; password: str
+class BankInfoReq(BaseModel): bank_name: str; branch_name: str; ifsc_code: str; swift_code: str; routing_number: str; support_email: str; support_phone: str; address: str; reserve_ratio: float = 12.5
+class DepositReq(BaseModel): amount: float = Field(..., gt=0); description: Optional[str] = "Cash Deposit"
+class WithdrawReq(BaseModel): amount: float = Field(..., gt=0); description: Optional[str] = "Cash Withdrawal"
+class TransferReq(BaseModel): to_account_number: str; amount: float = Field(..., gt=0); description: Optional[str] = "Funds Transfer"
+class CreateCustomerReq(BaseModel): username: str; password: str; full_name: str; email: str; phone: str; account_type: str = "Savings"; initial_deposit: float = Field(0.0, ge=0)
+class StatusReq(BaseModel): status: str = Field(..., pattern="^(active|frozen)$")
 
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-class BankInfoUpdateRequest(BaseModel):
-    bank_name: str
-    branch_name: str
-    ifsc_code: str
-    swift_code: str
-    routing_number: str
-    support_email: str
-    support_phone: str
-    address: str
-    reserve_ratio: float = 12.5
-
-class DepositRequest(BaseModel):
-    amount: float = Field(..., gt=0, description="Amount to deposit, must be positive")
-    description: Optional[str] = "Cash Deposit"
-
-class WithdrawRequest(BaseModel):
-    amount: float = Field(..., gt=0, description="Amount to withdraw, must be positive")
-    description: Optional[str] = "Cash Withdrawal"
-
-class TransferRequest(BaseModel):
-    to_account_number: str
-    amount: float = Field(..., gt=0, description="Amount to transfer, must be positive")
-    description: Optional[str] = "Funds Transfer"
-
-class CreateCustomerRequest(BaseModel):
-    username: str
-    password: str
-    full_name: str
-    email: str
-    phone: str
-    account_type: str = "Savings"
-    initial_deposit: float = Field(0.0, ge=0)
-
-class AccountStatusUpdate(BaseModel):
-    status: str = Field(..., pattern="^(active|frozen)$")
-
-# ----------------- Auth Endpoints -----------------
-
+# Auth
 @app.post("/api/auth/login")
-def login(creds: LoginRequest, response: Response):
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, username, password_hash, salt, role, full_name, email FROM users WHERE username = ?", (creds.username,))
-    user = cursor.fetchone()
-    conn.close()
-
-    if not user or not verify_password(user["password_hash"], user["salt"], creds.password):
-        raise HTTPException(status_code=400, detail="Invalid username or password")
-
-    token = create_session(user["id"])
-    response.set_cookie(key="session_token", value=token, httponly=True, samesite="lax")
-
-    return {
-        "token": token,
-        "user": {
-            "id": user["id"],
-            "username": user["username"],
-            "role": user["role"],
-            "full_name": user["full_name"],
-            "email": user["email"]
-        }
-    }
+def login(c: LoginReq, response: Response):
+    u = db_query("SELECT * FROM users WHERE username = ?", (c.username,), one=True)
+    if not u or not verify_password(u["password_hash"], u["salt"], c.password):
+        raise HTTPException(400, "Invalid username or password")
+    token = create_session(u["id"])
+    response.set_cookie("session_token", token, httponly=True, samesite="lax")
+    return {"token": token, "user": {"id": u["id"], "username": u["username"], "role": u["role"], "full_name": u["full_name"], "email": u["email"]}}
 
 @app.post("/api/auth/logout")
 def logout(request: Request, response: Response):
-    auth_header = request.headers.get("Authorization")
-    token = None
-    if auth_header and auth_header.startswith("Bearer "):
-        token = auth_header.split(" ")[1]
-    if not token:
-        token = request.cookies.get("session_token")
-    
-    if token:
-        delete_session(token)
-    response.delete_cookie(key="session_token")
+    auth = request.headers.get("Authorization")
+    token = auth.split(" ")[1] if (auth and auth.startswith("Bearer ")) else request.cookies.get("session_token")
+    if token: delete_session(token)
+    response.delete_cookie("session_token")
     return {"message": "Logged out successfully"}
 
 @app.get("/api/auth/me")
 def get_me(user: dict = Depends(get_current_user)):
     return {"user": user}
 
-# ----------------- Bank Info Endpoints -----------------
-
+# Bank Info
 @app.get("/api/bank/info")
 def get_bank_info():
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM bank_info WHERE id = 1")
-    info = cursor.fetchone()
-    conn.close()
-    if not info:
-        raise HTTPException(status_code=404, detail="Bank information not found")
-    return dict(info)
+    info = db_query("SELECT * FROM bank_info WHERE id = 1", one=True)
+    if not info: raise HTTPException(404, "Bank information not found")
+    return info
 
 @app.put("/api/bank/info")
-def update_bank_info(payload: BankInfoUpdateRequest, admin: dict = Depends(get_admin_user)):
-    conn = get_db()
-    cursor = conn.cursor()
-    now_iso = datetime.now(timezone.utc).isoformat()
-    cursor.execute("""
-        UPDATE bank_info SET
-            bank_name = ?, branch_name = ?, ifsc_code = ?, swift_code = ?,
-            routing_number = ?, support_email = ?, support_phone = ?,
-            address = ?, reserve_ratio = ?, updated_at = ?
-        WHERE id = 1
-    """, (
-        payload.bank_name, payload.branch_name, payload.ifsc_code, payload.swift_code,
-        payload.routing_number, payload.support_email, payload.support_phone,
-        payload.address, payload.reserve_ratio, now_iso
-    ))
-    conn.commit()
-    conn.close()
+def update_bank_info(p: BankInfoReq, admin: dict = Depends(get_admin_user)):
+    now = datetime.now(timezone.utc).isoformat()
+    db_execute("""UPDATE bank_info SET bank_name=?, branch_name=?, ifsc_code=?, swift_code=?, routing_number=?,
+               support_email=?, support_phone=?, address=?, reserve_ratio=?, updated_at=? WHERE id=1""",
+               (p.bank_name, p.branch_name, p.ifsc_code, p.swift_code, p.routing_number, p.support_email, p.support_phone, p.address, p.reserve_ratio, now))
     return {"message": "Bank details updated successfully"}
 
-# ----------------- Admin Endpoints -----------------
-
+# Admin
 @app.get("/api/admin/metrics")
 def get_admin_metrics(admin: dict = Depends(get_admin_user)):
-    conn = get_db()
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT COUNT(*) FROM accounts")
-    total_accounts = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COUNT(*) FROM accounts WHERE status = 'active'")
-    active_accounts = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COALESCE(SUM(balance), 0) FROM accounts")
-    total_vault_deposits = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COUNT(*) FROM transactions")
-    total_transactions = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COALESCE(SUM(amount), 0) FROM transactions")
-    total_volume = cursor.fetchone()[0]
-
-    conn.close()
-    return {
-        "total_accounts": total_accounts,
-        "active_accounts": active_accounts,
-        "frozen_accounts": total_accounts - active_accounts,
-        "total_vault_deposits": round(total_vault_deposits, 2),
-        "total_transactions": total_transactions,
-        "total_volume": round(total_volume, 2),
-    }
+    a = db_query("SELECT COUNT(*) c, SUM(CASE WHEN status='active' THEN 1 ELSE 0 END) a, COALESCE(SUM(balance), 0) b FROM accounts", one=True)
+    t = db_query("SELECT COUNT(*) c, COALESCE(SUM(amount), 0) v FROM transactions", one=True)
+    return {"total_accounts": a["c"], "active_accounts": a["a"], "frozen_accounts": a["c"] - a["a"],
+            "total_vault_deposits": round(a["b"], 2), "total_transactions": t["c"], "total_volume": round(t["v"], 2)}
 
 @app.get("/api/admin/accounts")
 def list_admin_accounts(admin: dict = Depends(get_admin_user)):
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT a.id, a.account_number, a.account_type, a.balance, a.status, a.created_at,
-               u.id as user_id, u.username, u.full_name, u.email, u.phone
-        FROM accounts a
-        JOIN users u ON a.user_id = u.id
-        ORDER BY a.id DESC
-    """)
-    rows = cursor.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    return db_query("""SELECT a.*, u.id as user_id, u.username, u.full_name, u.email, u.phone 
+                    FROM accounts a JOIN users u ON a.user_id = u.id ORDER BY a.id DESC""")
 
 @app.post("/api/admin/accounts")
-def create_customer_account(payload: CreateCustomerRequest, admin: dict = Depends(get_admin_user)):
-    conn = get_db()
-    cursor = conn.cursor()
-
-    # Check if username or email already exists
-    cursor.execute("SELECT id FROM users WHERE username = ? OR email = ?", (payload.username, payload.email))
-    if cursor.fetchone():
-        conn.close()
-        raise HTTPException(status_code=400, detail="Username or Email already registered")
-
-    now_iso = datetime.now(timezone.utc).isoformat()
-    pwd_hash, salt = hash_password(payload.password)
-
-    try:
-        # Create user
-        cursor.execute("""
-            INSERT INTO users (username, password_hash, salt, role, full_name, email, phone, created_at)
-            VALUES (?, ?, ?, 'user', ?, ?, ?, ?)
-        """, (payload.username, pwd_hash, salt, payload.full_name, payload.email, payload.phone, now_iso))
-        user_id = cursor.lastrowid
-
-        # Generate unique account number
-        acc_num = f"ACC-{secrets.randbelow(90000000) + 10000000}"
-
-        # Create account
-        cursor.execute("""
-            INSERT INTO accounts (user_id, account_number, account_type, balance, status, created_at)
-            VALUES (?, ?, ?, ?, 'active', ?)
-        """, (user_id, acc_num, payload.account_type, payload.initial_deposit, now_iso))
-        acc_id = cursor.lastrowid
-
-        # If initial deposit > 0, log transaction
-        if payload.initial_deposit > 0:
-            ref = "TXN-" + secrets.token_hex(4).upper()
-            cursor.execute("""
-                INSERT INTO transactions (reference_id, from_account_id, to_account_id, transaction_type, amount, description, timestamp)
-                VALUES (?, NULL, ?, 'deposit', ?, 'Initial Account Opening Deposit', ?)
-            """, (ref, acc_id, payload.initial_deposit, now_iso))
-
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        conn.close()
-        raise HTTPException(status_code=500, detail=str(e))
-
-    conn.close()
+def create_customer_account(p: CreateCustomerReq, admin: dict = Depends(get_admin_user)):
+    if db_query("SELECT id FROM users WHERE username = ? OR email = ?", (p.username, p.email), one=True):
+        raise HTTPException(400, "Username or Email already registered")
+    now, (pwd_hash, salt) = datetime.now(timezone.utc).isoformat(), hash_password(p.password)
+    uid = db_execute("INSERT INTO users VALUES (NULL, ?, ?, ?, 'user', ?, ?, ?, ?)", (p.username, pwd_hash, salt, p.full_name, p.email, p.phone, now))
+    acc_num = f"ACC-{secrets.randbelow(90000000) + 10000000}"
+    aid = db_execute("INSERT INTO accounts VALUES (NULL, ?, ?, ?, ?, 'active', ?)", (uid, acc_num, p.account_type, p.initial_deposit, now))
+    if p.initial_deposit > 0:
+        db_execute("INSERT INTO transactions VALUES (NULL, ?, NULL, ?, 'deposit', ?, 'Initial Account Opening Deposit', ?)",
+                   ("TXN-" + secrets.token_hex(4).upper(), aid, p.initial_deposit, now))
     return {"message": "Customer account created successfully", "account_number": acc_num}
 
 @app.patch("/api/admin/accounts/{account_number}/status")
-def toggle_account_status(account_number: str, payload: AccountStatusUpdate, admin: dict = Depends(get_admin_user)):
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, status FROM accounts WHERE account_number = ?", (account_number,))
-    acc = cursor.fetchone()
-    if not acc:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Account not found")
-
-    cursor.execute("UPDATE accounts SET status = ? WHERE account_number = ?", (payload.status, account_number))
-    conn.commit()
-    conn.close()
-    return {"message": f"Account status updated to {payload.status}"}
+def toggle_account_status(account_number: str, p: StatusReq, admin: dict = Depends(get_admin_user)):
+    if not db_query("SELECT id FROM accounts WHERE account_number = ?", (account_number,), one=True):
+        raise HTTPException(404, "Account not found")
+    db_execute("UPDATE accounts SET status = ? WHERE account_number = ?", (p.status, account_number))
+    return {"message": f"Account status updated to {p.status}"}
 
 @app.get("/api/admin/transactions")
 def list_all_transactions(admin: dict = Depends(get_admin_user)):
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT t.id, t.reference_id, t.transaction_type, t.amount, t.description, t.timestamp,
-               t.from_account_id, t.to_account_id,
-               fa.account_number as from_account_number, fu.full_name as from_user_name,
-               ta.account_number as to_account_number, tu.full_name as to_user_name
-        FROM transactions t
-        LEFT JOIN accounts fa ON t.from_account_id = fa.id
-        LEFT JOIN users fu ON fa.user_id = fu.id
-        LEFT JOIN accounts ta ON t.to_account_id = ta.id
-        LEFT JOIN users tu ON ta.user_id = tu.id
-        ORDER BY t.id DESC
-        LIMIT 200
-    """)
-    rows = cursor.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    return db_query("""SELECT t.*, fa.account_number as from_account_number, fu.full_name as from_user_name,
+                    ta.account_number as to_account_number, tu.full_name as to_user_name
+                    FROM transactions t LEFT JOIN accounts fa ON t.from_account_id = fa.id
+                    LEFT JOIN users fu ON fa.user_id = fu.id LEFT JOIN accounts ta ON t.to_account_id = ta.id
+                    LEFT JOIN users tu ON ta.user_id = tu.id ORDER BY t.id DESC LIMIT 200""")
 
-# ----------------- User / Customer Endpoints -----------------
-
+# Customer
 @app.get("/api/user/account")
 def get_user_account(user: dict = Depends(get_current_user)):
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT a.id, a.account_number, a.account_type, a.balance, a.status, a.created_at,
-               b.bank_name, b.branch_name, b.ifsc_code, b.swift_code
-        FROM accounts a
-        CROSS JOIN bank_info b
-        WHERE a.user_id = ? AND b.id = 1
-    """, (user["id"],))
-    account = cursor.fetchone()
-    conn.close()
-
-    if not account:
-        raise HTTPException(status_code=404, detail="No active bank account associated with this profile")
-
-    # Generate deterministic card presentation details based on account number
-    acc_clean = account["account_number"].replace("ACC-", "")
-    card_number = f"4892 {acc_clean[:4]} {acc_clean[4:8]} 9012"
-
-    return {
-        **dict(account),
-        "user_full_name": user["full_name"],
-        "user_email": user["email"],
-        "user_phone": user.get("phone", "N/A"),
-        "card_number": card_number,
-        "card_expiry": "11/29",
-        "card_type": "Apex Platinum Debit"
-    }
+    acc = db_query("SELECT a.*, b.bank_name, b.branch_name, b.ifsc_code, b.swift_code FROM accounts a CROSS JOIN bank_info b WHERE a.user_id = ? AND b.id = 1", (user["id"],), one=True)
+    if not acc: raise HTTPException(404, "No active bank account associated with this profile")
+    c = acc["account_number"].replace("ACC-", "")
+    return {**acc, "user_full_name": user["full_name"], "user_email": user["email"], "user_phone": user.get("phone", "N/A"),
+            "card_number": f"4892 {c[:4]} {c[4:8]} 9012", "card_expiry": "11/29", "card_type": "Apex Platinum Debit"}
 
 @app.get("/api/user/lookup-account/{account_number}")
 def lookup_account(account_number: str, user: dict = Depends(get_current_user)):
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT a.account_number, a.status, u.full_name
-        FROM accounts a
-        JOIN users u ON a.user_id = u.id
-        WHERE a.account_number = ?
-    """, (account_number.strip(),))
-    dest = cursor.fetchone()
-    conn.close()
-
-    if not dest:
-        raise HTTPException(status_code=404, detail="Destination account does not exist")
-    if dest["status"] != "active":
-        raise HTTPException(status_code=400, detail="Destination account is currently frozen or inactive")
-
-    return {
-        "account_number": dest["account_number"],
-        "recipient_name": dest["full_name"],
-        "status": dest["status"]
-    }
+    dest = db_query("SELECT a.account_number, a.status, u.full_name as recipient_name FROM accounts a JOIN users u ON a.user_id = u.id WHERE a.account_number = ?", (account_number.strip(),), one=True)
+    if not dest: raise HTTPException(404, "Destination account does not exist")
+    if dest["status"] != "active": raise HTTPException(400, "Destination account is currently frozen or inactive")
+    return dest
 
 @app.post("/api/user/deposit")
-def user_deposit(payload: DepositRequest, user: dict = Depends(get_current_user)):
-    conn = get_db()
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT id, balance, status FROM accounts WHERE user_id = ?", (user["id"],))
-    acc = cursor.fetchone()
-
-    if not acc:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Account not found")
-    if acc["status"] != "active":
-        conn.close()
-        raise HTTPException(status_code=403, detail="Account is frozen. Contact administrator.")
-
-    new_balance = round(acc["balance"] + payload.amount, 2)
-    ref = "TXN-" + secrets.token_hex(4).upper()
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    try:
-        cursor.execute("UPDATE accounts SET balance = ? WHERE id = ?", (new_balance, acc["id"]))
-        cursor.execute("""
-            INSERT INTO transactions (reference_id, from_account_id, to_account_id, transaction_type, amount, description, timestamp)
-            VALUES (?, NULL, ?, 'deposit', ?, ?, ?)
-        """, (ref, acc["id"], payload.amount, payload.description or "Online Deposit", now_iso))
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        conn.close()
-        raise HTTPException(status_code=500, detail=str(e))
-
-    conn.close()
-    return {
-        "message": f"Successfully deposited ₹{payload.amount:,.2f}",
-        "reference_id": ref,
-        "new_balance": new_balance
-    }
+def user_deposit(p: DepositReq, user: dict = Depends(get_current_user)):
+    acc = db_query("SELECT id, balance, status FROM accounts WHERE user_id = ?", (user["id"],), one=True)
+    if not acc or acc["status"] != "active": raise HTTPException(400, "Account frozen or not found")
+    new_bal, ref, now = round(acc["balance"] + p.amount, 2), "TXN-" + secrets.token_hex(4).upper(), datetime.now(timezone.utc).isoformat()
+    db_execute("UPDATE accounts SET balance = ? WHERE id = ?", (new_bal, acc["id"]))
+    db_execute("INSERT INTO transactions VALUES (NULL, ?, NULL, ?, 'deposit', ?, ?, ?)", (ref, acc["id"], p.amount, p.description or "Online Deposit", now))
+    return {"message": f"Successfully deposited ₹{p.amount:,.2f}", "reference_id": ref, "new_balance": new_bal}
 
 @app.post("/api/user/withdraw")
-def user_withdraw(payload: WithdrawRequest, user: dict = Depends(get_current_user)):
-    conn = get_db()
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT id, balance, status FROM accounts WHERE user_id = ?", (user["id"],))
-    acc = cursor.fetchone()
-
-    if not acc:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Account not found")
-    if acc["status"] != "active":
-        conn.close()
-        raise HTTPException(status_code=403, detail="Account is frozen. Withdrawals suspended.")
-    if acc["balance"] < payload.amount:
-        conn.close()
-        raise HTTPException(status_code=400, detail=f"Insufficient balance. Current balance: ₹{acc['balance']:,.2f}")
-
-    new_balance = round(acc["balance"] - payload.amount, 2)
-    ref = "TXN-" + secrets.token_hex(4).upper()
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    try:
-        cursor.execute("UPDATE accounts SET balance = ? WHERE id = ?", (new_balance, acc["id"]))
-        cursor.execute("""
-            INSERT INTO transactions (reference_id, from_account_id, to_account_id, transaction_type, amount, description, timestamp)
-            VALUES (?, ?, NULL, 'withdrawal', ?, ?, ?)
-        """, (ref, acc["id"], payload.amount, payload.description or "ATM/Online Withdrawal", now_iso))
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        conn.close()
-        raise HTTPException(status_code=500, detail=str(e))
-
-    conn.close()
-    return {
-        "message": f"Successfully withdrawn ₹{payload.amount:,.2f}",
-        "reference_id": ref,
-        "new_balance": new_balance
-    }
+def user_withdraw(p: WithdrawReq, user: dict = Depends(get_current_user)):
+    acc = db_query("SELECT id, balance, status FROM accounts WHERE user_id = ?", (user["id"],), one=True)
+    if not acc or acc["status"] != "active": raise HTTPException(400, "Account frozen or not found")
+    if acc["balance"] < p.amount: raise HTTPException(400, f"Insufficient balance. Current balance: ₹{acc['balance']:,.2f}")
+    new_bal, ref, now = round(acc["balance"] - p.amount, 2), "TXN-" + secrets.token_hex(4).upper(), datetime.now(timezone.utc).isoformat()
+    db_execute("UPDATE accounts SET balance = ? WHERE id = ?", (new_bal, acc["id"]))
+    db_execute("INSERT INTO transactions VALUES (NULL, ?, ?, NULL, 'withdrawal', ?, ?, ?)", (ref, acc["id"], p.amount, p.description or "ATM Withdrawal", now))
+    return {"message": f"Successfully withdrawn ₹{p.amount:,.2f}", "reference_id": ref, "new_balance": new_bal}
 
 @app.post("/api/user/transfer")
-def user_transfer(payload: TransferRequest, user: dict = Depends(get_current_user)):
-    conn = get_db()
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT id, account_number, balance, status FROM accounts WHERE user_id = ?", (user["id"],))
-    src = cursor.fetchone()
-
-    if not src:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Sender account not found")
-    if src["status"] != "active":
-        conn.close()
-        raise HTTPException(status_code=403, detail="Your account is frozen. Transfers are prohibited.")
-
-    target_acc_num = payload.to_account_number.strip()
-    if target_acc_num == src["account_number"]:
-        conn.close()
-        raise HTTPException(status_code=400, detail="Cannot transfer funds to the same account")
-
-    cursor.execute("SELECT id, balance, status FROM accounts WHERE account_number = ?", (target_acc_num,))
-    dest = cursor.fetchone()
-
-    if not dest:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Destination account not found")
-    if dest["status"] != "active":
-        conn.close()
-        raise HTTPException(status_code=400, detail="Destination account is inactive or frozen")
-
-    if src["balance"] < payload.amount:
-        conn.close()
-        raise HTTPException(status_code=400, detail=f"Insufficient balance. Current balance: ₹{src['balance']:,.2f}")
-
-    new_src_balance = round(src["balance"] - payload.amount, 2)
-    new_dest_balance = round(dest["balance"] + payload.amount, 2)
-    ref = "TXN-" + secrets.token_hex(4).upper()
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    try:
-        cursor.execute("UPDATE accounts SET balance = ? WHERE id = ?", (new_src_balance, src["id"]))
-        cursor.execute("UPDATE accounts SET balance = ? WHERE id = ?", (new_dest_balance, dest["id"]))
-        cursor.execute("""
-            INSERT INTO transactions (reference_id, from_account_id, to_account_id, transaction_type, amount, description, timestamp)
-            VALUES (?, ?, ?, 'transfer', ?, ?, ?)
-        """, (ref, src["id"], dest["id"], payload.amount, payload.description or "Peer Transfer", now_iso))
+def user_transfer(p: TransferReq, user: dict = Depends(get_current_user)):
+    src = db_query("SELECT id, account_number, balance, status FROM accounts WHERE user_id = ?", (user["id"],), one=True)
+    if not src or src["status"] != "active": raise HTTPException(400, "Account inactive or frozen")
+    t_acc = p.to_account_number.strip()
+    if t_acc == src["account_number"]: raise HTTPException(400, "Cannot transfer funds to the same account")
+    dest = db_query("SELECT id, balance, status FROM accounts WHERE account_number = ?", (t_acc,), one=True)
+    if not dest: raise HTTPException(404, "Destination account not found")
+    if dest["status"] != "active": raise HTTPException(400, "Destination account is inactive or frozen")
+    if src["balance"] < p.amount: raise HTTPException(400, f"Insufficient balance. Current balance: ₹{src['balance']:,.2f}")
+    new_src, new_dest = round(src["balance"] - p.amount, 2), round(dest["balance"] + p.amount, 2)
+    ref, now = "TXN-" + secrets.token_hex(4).upper(), datetime.now(timezone.utc).isoformat()
+    with get_db() as conn:
+        conn.execute("UPDATE accounts SET balance = ? WHERE id = ?", (new_src, src["id"]))
+        conn.execute("UPDATE accounts SET balance = ? WHERE id = ?", (new_dest, dest["id"]))
+        conn.execute("INSERT INTO transactions VALUES (NULL, ?, ?, ?, 'transfer', ?, ?, ?)", (ref, src["id"], dest["id"], p.amount, p.description or "Peer Transfer", now))
         conn.commit()
-    except Exception as e:
-        conn.rollback()
-        conn.close()
-        raise HTTPException(status_code=500, detail=str(e))
-
-    conn.close()
-    return {
-        "message": f"Successfully transferred ₹{payload.amount:,.2f} to {target_acc_num}",
-        "reference_id": ref,
-        "new_balance": new_src_balance
-    }
+    return {"message": f"Successfully transferred ₹{p.amount:,.2f} to {t_acc}", "reference_id": ref, "new_balance": new_src}
 
 @app.get("/api/user/transactions")
 def get_user_transactions(user: dict = Depends(get_current_user)):
-    conn = get_db()
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT id FROM accounts WHERE user_id = ?", (user["id"],))
-    acc = cursor.fetchone()
-    if not acc:
-        conn.close()
-        return []
-
-    acc_id = acc["id"]
-    cursor.execute("""
-        SELECT t.id, t.reference_id, t.transaction_type, t.amount, t.description, t.timestamp,
-               t.from_account_id, t.to_account_id,
-               fa.account_number as from_account_number, fu.full_name as from_user_name,
-               ta.account_number as to_account_number, tu.full_name as to_user_name
-        FROM transactions t
-        LEFT JOIN accounts fa ON t.from_account_id = fa.id
-        LEFT JOIN users fu ON fa.user_id = fu.id
-        LEFT JOIN accounts ta ON t.to_account_id = ta.id
-        LEFT JOIN users tu ON ta.user_id = tu.id
-        WHERE t.from_account_id = ? OR t.to_account_id = ?
-        ORDER BY t.id DESC
-        LIMIT 100
-    """, (acc_id, acc_id))
-
-    rows = cursor.fetchall()
-    conn.close()
-
-    result = []
-    for r in rows:
-        d = dict(r)
-        # Determine if it's credit or debit for this user
-        if d["transaction_type"] == "deposit" or d["to_account_id"] == acc_id:
-            d["flow"] = "credit"
-        else:
-            d["flow"] = "debit"
-        result.append(d)
-
-    return result
-
-# ----------------- Frontend HTML Root -----------------
+    acc = db_query("SELECT id FROM accounts WHERE user_id = ?", (user["id"],), one=True)
+    if not acc: return []
+    aid = acc["id"]
+    txs = db_query("""SELECT t.*, fa.account_number as from_account_number, fu.full_name as from_user_name,
+                   ta.account_number as to_account_number, tu.full_name as to_user_name
+                   FROM transactions t LEFT JOIN accounts fa ON t.from_account_id = fa.id
+                   LEFT JOIN users fu ON fa.user_id = fu.id LEFT JOIN accounts ta ON t.to_account_id = ta.id
+                   LEFT JOIN users tu ON ta.user_id = tu.id WHERE t.from_account_id = ? OR t.to_account_id = ?
+                   ORDER BY t.id DESC LIMIT 100""", (aid, aid))
+    for t in txs: t["flow"] = "credit" if (t["transaction_type"] == "deposit" or t["to_account_id"] == aid) else "debit"
+    return txs
 
 @app.get("/", response_class=HTMLResponse)
 def index_view():
-    template_path = os.path.join(os.path.dirname(__file__), "templates", "index.html")
-    with open(template_path, "r", encoding="utf-8") as f:
-        html_content = f.read()
-    return HTMLResponse(content=html_content)
+    with open(os.path.join(os.path.dirname(__file__), "templates", "index.html"), "r", encoding="utf-8") as f:
+        return HTMLResponse(content=f.read())
 
 if __name__ == "__main__":
     import uvicorn

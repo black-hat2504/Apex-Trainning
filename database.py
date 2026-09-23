@@ -11,6 +11,22 @@ def get_db():
     conn.row_factory = sqlite3.Row
     return conn
 
+def db_query(query: str, args: tuple = (), one: bool = False):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(query, args)
+        rows = cur.fetchall()
+        if one:
+            return dict(rows[0]) if rows else None
+        return [dict(r) for r in rows]
+
+def db_execute(query: str, args: tuple = ()) -> int:
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(query, args)
+        conn.commit()
+        return cur.lastrowid
+
 def hash_password(password: str, salt: str = None) -> tuple[str, str]:
     if not salt:
         salt = secrets.token_hex(16)
